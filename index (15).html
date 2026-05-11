@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D L-Physics: Pure Chaos</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; touch-action: none; font-family: 'Courier New', Courier, monospace; }
+        canvas { display: block; }
+        #ui { position: fixed; top: 10px; left: 10px; color: #fff; font-size: 18px; pointer-events: none; text-shadow: 2px 2px #000; }
+        #controls { position: fixed; top: 40px; left: 10px; color: #fff; z-index: 20; background: rgba(0,0,0,0.5); padding: 8px; border-radius: 5px; display: flex; flex-direction: column; gap: 5px; }
+        #overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; justify-content: center; align-items: center; color: white; font-size: 30px; cursor: pointer; z-index: 30; }
+        #resetBtn { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 15px 30px; font-size: 20px; background: #fff; color: #000; border: none; cursor: pointer; display: none; z-index: 40; font-weight: bold; border-radius: 5px; }
+        input[type="checkbox"] { vertical-align: middle; cursor: pointer; pointer-events: auto; }
+        label { cursor: pointer; pointer-events: auto; font-size: 14px; }
+    </style>
+</head>
+<body>
+
+<div id="overlay">TAP TO START</div>
+<button id="resetBtn">REPAIR GUNS</button>
+<div id="ui">SLOW-MO: <span id="timer" style="color: #0f0;">2.0</span>s | HP: <span id="hpDisplay" style="color: #fff;">100</span>%</div>
+
+<div id="controls">
+    <div>
+        <input type="checkbox" id="hitboxToggle">
+        <label for="hitboxToggle">Show Hitboxes</label>
+    </div>
+    <div>
+        <input type="checkbox" id="raycastToggle">
+        <label for="raycastToggle">Show Raycast</label>
+    </div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const timerEl = document.getElementById('timer');
+const hpDisplay = document.getElementById('hpDisplay');
+const overlay = document.getElementById('overlay');
+const resetBtn = document.getElementById('resetBtn');
+const hitboxToggle = document.getElementById('hitboxToggle');
+const raycastToggle = document.getElementById('raycastToggle');
+
+// Audio setup
+const Gunshot = new Audio('Gunshot.mp3');
+const Deflect = new Audio('Bullet_deflect.mp3');
+const CrackSound = new Audio('Crack.mp3');
+const ShatterSound = new Audio('Shatter.mp3');
+
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+let slowMoSeconds = 2.0; 
+let isSlowMoActive = false;
+let gameRunning = false;
+let chunks = [];
+
+const GRAVITY = 0; 
+const FRICTION = 0.98; 
+const ANGULAR_FRICTION = 0.70; 
+const BOUNCE = 0.6; 
+const KICKBACK = 26; 
+
+const L_SHAPE = { vW: 25, vH: 150, hW: 65, hH: 25 };
+
+function createEntity(x, y, angle, color, sideCol, topCol, isPlayer) {
+    return {
+        x, y, vx: 0, vy: 0, angle, vAngle: 0,
+        hits: 0, cracks: [], shattered: false,
+        ...L_SHAPE, mainCol: color, sideCol, topCol, isPlayer
+    };
+}
+
+let player = createEntity(200, 300, 0, "#0000FF", "#000066", "#1e1e96", true);
+let enemy = createEntity(canvas.width - 200, 300, Math.PI, "#FF0000", "#660000", "#961e1e", false);
+enemy.lastShot = Date.now();
+
+let bullets = [];
+
+overlay.addEventListener('click', () => {
+    overlay.style.display = 'none';
+    gameRunning = true;
+});
+
+resetBtn.addEventListener('click', () => {
+    player = createEntity(200, 300, 0, "#0000FF", "#000066", "#1e1e96", true);
+    enemy = createEntity(canvas.width - 200, 300, Math.PI, "#FF0000", "#660000", "#961e1e", false);
+    enemy.lastShot = Date.now();
+    chunks = [];
+    resetBtn.style.display = 'none';
+});
+
+function playGunshot() {
+    const s = Gunshot.cloneNode();
+    s.volume = 0.4;
+    s.play().catch(()=>{});
+}
+
+function playImpact(type) {
+    let s;
+    if (type === 'crack') s = CrackSound.cloneNode();
+    else if (type === 'shatter') s = ShatterSound.cloneNode();
+    else s = Deflect.cloneNode();
+    s.volume = 0.8;
+    s.play().catch(()=>{});
+    s.ontimeupdate = function() {
+        if (this.currentTime >= 0.45) {
+            this.pause();
+            this.ontimeupdate = null;
+        }
+    };
+}
+
+function spawnTriangleChunks(p) {
+    playImpact('shatter'); 
+    const cos = Math.cos(p.angle);
+    const sin = Math.sin(p.angle);
+
+    for(let i=0; i<20; i++) {
+        const pts = [
+            {x: (Math.random()-0.5)*40, y: (Math.random()-0.5)*40},
+            {x: (Math.random()-0.5)*40, y: (Math.random()-0.5)*40},
+            {x: (Math.random()-0.5)*40, y: (Math.random()-0.5)*40}
+        ];
+        chunks.push({
+            x: p.x, y: p.y,
+            vx: (Math.random()-0.5)*25, vy: (Math.random()-0.5)*25,
+            angle: Math.random()*Math.PI*2, vAngle: (Math.random()-0.5)*0.4,
+            pts, color: p.mainCol, type: 'triangle'
+        });
+    }
+
+    const parts = [
+        { x: 30, y: -60, w: 180, h: 30, type: 'rect', col: p.mainCol }, 
+        { x: -30, y: -2, w: 40, h: 85, type: 'rect', col: p.sideCol, angle: 0.2 }, 
+        { x: 15, y: -35, w: 30, h: 20, type: 'stroke', col: p.mainCol } 
+    ];
+
+    parts.forEach(part => {
+        const rx = part.x * cos - part.y * sin;
+        const ry = part.x * sin + part.y * cos;
+        chunks.push({
+            x: p.x + rx, y: p.y + ry,
+            vx: p.vx + (Math.random() - 0.5) * 20, 
+            vy: p.vy + (Math.random() - 0.5) * 20,
+            angle: p.angle + (part.angle || 0), 
+            vAngle: (Math.random() - 0.5) * 0.4,
+            w: part.w, h: part.h, color: part.col, type: part.type
+        });
+    });
+
+    p.shattered = true;
+    resetBtn.style.display = 'block';
+}
+
+function addCrack(p) {
+    playImpact('crack');
+    const crack = [];
+    let curX = -40 + Math.random() * 80;
+    let curY = -70 + Math.random() * 20;
+    for(let i=0; i<5; i++) {
+        crack.push({x: curX, y: curY});
+        curX += (Math.random() - 0.5) * 15;
+        curY += (Math.random() - 0.5) * 15;
+    }
+    p.cracks.push(crack);
+}
+
+function getCorners(p) {
+    const c = Math.cos(p.angle); const s = Math.sin(p.angle);
+    const pts = [
+        {x: -60, y: -75}, {x: 120, y: -75}, 
+        {x: 120, y: -45}, {x: 0, y: -45},   
+        {x: -20, y: 40},  {x: -60, y: 40}   
+    ];
+    return pts.map(pt => ({ x: p.x + pt.x * c - pt.y * s, y: p.y + pt.x * s + pt.y * c }));
+}
+
+function getBoundingRect(p) {
+    const corners = getCorners(p);
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    corners.forEach(pt => {
+        if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y;
+    });
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+function getBarrelPos(p) {
+    const c = Math.cos(p.angle); const s = Math.sin(p.angle);
+    let offsetX = 120; let offsetY = -60; 
+    return {
+        x: p.x + offsetX * c - offsetY * s,
+        y: p.y + offsetX * s + offsetY * c
+    };
+}
+
+function createBullet(owner) {
+    if (owner.shattered) return;
+    const pos = getBarrelPos(owner);
+    const shootAngle = owner.angle; 
+    if (gameRunning) playGunshot();
+
+    if (owner.isPlayer) {
+        const rVX = Math.cos(shootAngle); const rVY = Math.sin(shootAngle);
+        for(let d=0; d<1000; d+=40) { 
+            let px = pos.x + rVX*d; let py = pos.y + rVY*d;
+            const eRect = getBoundingRect(enemy);
+            if (!enemy.shattered && px > eRect.x && px < eRect.x + eRect.w && py > eRect.y && py < eRect.y + eRect.h) { 
+                isSlowMoActive = true; 
+                slowMoSeconds = 2.0; 
+                break; 
+            }
+        }
+    }
+
+    bullets.push({
+        x: pos.x, y: pos.y,
+        vx: Math.cos(shootAngle) * 28,
+        vy: Math.sin(shootAngle) * 28,
+        fromPlayer: owner.isPlayer
+    });
+
+    owner.vx -= Math.cos(shootAngle) * KICKBACK;
+    owner.vy -= Math.sin(shootAngle) * KICKBACK;
+    // Recoil-based rotation (No cheating)
+    owner.vAngle += (Math.random() - 0.5) * 1.2;
+}
+
+function handlePhysics(p, ts) {
+    if (p.shattered) return;
+    p.vy += GRAVITY * ts; p.x += p.vx * ts; p.y += p.vy * ts;
+    p.angle += p.vAngle * ts; 
+    p.vx *= Math.pow(FRICTION, ts);
+    p.vy *= Math.pow(FRICTION, ts);
+    p.vAngle *= Math.pow(ANGULAR_FRICTION, ts);
+
+    const corners = getCorners(p);
+    corners.forEach(corner => {
+        if (corner.y > canvas.height) { 
+            p.y -= (corner.y - canvas.height) + 2; 
+            p.vy = -Math.abs(p.vy) * BOUNCE; 
+            p.vAngle += p.vx * 0.01; // Wall bounce affecting rotation
+        }
+        if (corner.y < 0) { 
+            p.y += Math.abs(corner.y) + 2; 
+            p.vy = Math.abs(p.vy) * BOUNCE; 
+            p.vAngle -= p.vx * 0.01;
+        }
+        if (corner.x < 0) { 
+            p.x += Math.abs(corner.x) + 2; 
+            p.vx = Math.abs(p.vx) * BOUNCE; 
+            p.vAngle += p.vy * 0.01;
+        }
+        if (corner.x > canvas.width) { 
+            p.x -= (corner.x - canvas.width) + 2; 
+            p.vx = -Math.abs(p.vx) * BOUNCE; 
+            p.vAngle -= p.vy * 0.01;
+        }
+    });
+}
+
+// --- NEW SMART AI LOGIC (RECOIL TARGETING) ---
+function runSmartAI(p, target, ts) {
+    if (p.shattered || !gameRunning) return;
+
+    // Calculate angle to player
+    const dx = target.x - p.x;
+    const dy = target.y - p.y;
+    const targetAngle = Math.atan2(dy, dx);
+    
+    // Normalize current angle
+    let currentAngle = p.angle % (Math.PI * 2);
+    if (currentAngle < 0) currentAngle += Math.PI * 2;
+    
+    let diff = targetAngle - currentAngle;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+
+    const barrel = getBarrelPos(p);
+    const dist = Math.sqrt(dx*dx + dy*dy);
+
+    // AI only fires if it's pointing reasonably close OR if it needs to spin
+    const canHit = Math.abs(diff) < 0.2;
+    const cooldown = isSlowMoActive ? 400 : 1200;
+
+    if (Date.now() - p.lastShot > cooldown) {
+        // Smart decision: Shoot to hit OR shoot to spin into position
+        if (canHit || Math.abs(p.vAngle) < 0.1) {
+            createBullet(p);
+            p.lastShot = Date.now();
+        }
+    }
+}
+
+function drawRaycast(p) {
+    if(!raycastToggle.checked || p.shattered) return;
+    const pos = getBarrelPos(p);
+    const shootAngle = p.angle;
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = p.isPlayer ? "rgba(0, 255, 255, 0.5)" : "rgba(255, 0, 0, 0.5)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(pos.x, pos.y);
+    ctx.lineTo(pos.x + Math.cos(shootAngle) * 2000, pos.y + Math.sin(shootAngle) * 2000);
+    ctx.stroke();
+    ctx.setLineDash([]);
+}
+
+function update() {
+    if (!gameRunning) return requestAnimationFrame(update);
+    let ts = isSlowMoActive ? 0.15 : 1;
+    if (isSlowMoActive) {
+        slowMoSeconds -= (0.016 * (1/ts)); 
+        if (slowMoSeconds <= 0) { isSlowMoActive = false; slowMoSeconds = 2.0; }
+    }
+
+    handlePhysics(player, ts);
+    handlePhysics(enemy, ts);
+    
+    // Call Smart AI
+    runSmartAI(enemy, player, ts);
+
+    if (chunks.length > 150) chunks.splice(0, 20);
+
+    chunks.forEach(c => {
+        c.x += c.vx * ts; c.y += c.vy * ts; c.angle += c.vAngle * ts;
+        if (c.x < 0 || c.x > canvas.width) c.vx *= -BOUNCE;
+        if (c.y < 0 || c.y > canvas.height) c.vy *= -BOUNCE;
+    });
+
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        let b = bullets[i];
+        b.x += b.vx * ts; b.y += b.vy * ts;
+        const eRect = getBoundingRect(enemy);
+        const pRect = getBoundingRect(player);
+        if (!enemy.shattered && b.fromPlayer && b.x > eRect.x && b.x < eRect.x + eRect.w && b.y > eRect.y && b.y < eRect.y + eRect.h) {
+            enemy.hits++;
+            if([5, 10, 15, 20].includes(enemy.hits)) addCrack(enemy);
+            else if(enemy.hits >= 25) spawnTriangleChunks(enemy);
+            else playImpact('deflect');
+            enemy.vx += b.vx * 0.2; enemy.vy += b.vy * 0.2; enemy.vAngle += (Math.random() - 0.5) * 0.2;
+            bullets.splice(i, 1); continue;
+        }
+        if (!player.shattered && !b.fromPlayer && b.x > pRect.x && b.x < pRect.x + pRect.w && b.y > pRect.y && b.y < pRect.y + pRect.h) {
+            player.hits++;
+            if([5, 10, 15, 20].includes(player.hits)) addCrack(player);
+            else if(player.hits >= 25) spawnTriangleChunks(player);
+            else playImpact('deflect');
+            player.vx += b.vx * 0.2; player.vy += b.vy * 0.2; player.vAngle += (Math.random() - 0.5) * 0.2;
+            bullets.splice(i, 1); continue;
+        }
+        if (b.x < -200 || b.x > canvas.width + 200 || b.y < -200 || b.y > canvas.height + 200) bullets.splice(i,1);
+    }
+
+    timerEl.innerText = Math.max(0, slowMoSeconds).toFixed(1);
+    hpDisplay.innerText = Math.max(0, 100 - (player.hits * 4)); 
+    draw(); 
+    requestAnimationFrame(update);
+}
+
+function drawL(p) {
+    if(p.shattered) return;
+    if(hitboxToggle.checked) {
+        const rect = getBoundingRect(p);
+        ctx.strokeStyle = "#0f0";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    }
+    drawRaycast(p);
+    ctx.save(); 
+    ctx.translate(p.x, p.y); 
+    ctx.rotate(p.angle);
+
+    const depth = 12; 
+
+    ctx.fillStyle = p.sideCol;
+    ctx.fillRect(-60, -75 + depth, 180, 30);
+    ctx.beginPath();
+    ctx.moveTo(-40, -45 + depth); ctx.lineTo(-60, 40 + depth); 
+    ctx.lineTo(-20, 40 + depth); ctx.lineTo(0, -45 + depth); 
+    ctx.fill();
+
+    ctx.fillStyle = p.mainCol;
+    ctx.fillRect(-60, -75, 180, 30); 
+    ctx.beginPath(); 
+    ctx.moveTo(-40, -45); ctx.lineTo(-60, 40); ctx.lineTo(-20, 40); ctx.lineTo(0, -45); ctx.fill();
+
+    ctx.strokeStyle = "rgba(255,255,255,0.3)"; 
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-60, -75, 180, 2); 
+    
+    ctx.fillStyle = "rgba(0,0,0,0.2)"; 
+    ctx.fillRect(-50, -65, 160, 10);
+
+    ctx.strokeStyle = p.mainCol; ctx.lineWidth = 3;
+    ctx.strokeRect(0, -45, 30, 20); 
+    ctx.strokeStyle = p.sideCol;
+    ctx.strokeRect(0, -45 + depth/2, 30, 20);
+
+    ctx.fillStyle = "#000"; 
+    ctx.fillRect(110, -70, 10, 20); 
+
+    if(p.cracks.length > 0) {
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.lineWidth = 2;
+        p.cracks.forEach(crack => {
+            ctx.beginPath();
+            ctx.moveTo(crack[0].x, crack[0].y);
+            for(let i=1; i<crack.length; i++) { ctx.lineTo(crack[i].x, crack[i].y); }
+            ctx.stroke();
+        });
+    }
+    ctx.restore();
+}
+
+function draw() {
+    ctx.fillStyle = '#050505'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawL(enemy);
+    drawL(player);
+    
+    chunks.forEach(c => {
+        ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.angle);
+        ctx.fillStyle = c.color;
+        if(c.type === 'triangle') {
+            ctx.beginPath();
+            ctx.moveTo(c.pts[0].x, c.pts[0].y);
+            ctx.lineTo(c.pts[1].x, c.pts[1].y);
+            ctx.lineTo(c.pts[2].x, c.pts[2].y);
+            ctx.closePath(); ctx.fill();
+            ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.stroke();
+        } else if(c.type === 'rect') {
+            ctx.fillRect(-c.w/2, -c.h/2, c.w, c.h);
+        } else if(c.type === 'stroke') {
+            ctx.strokeStyle = c.color; ctx.lineWidth = 3;
+            ctx.strokeRect(-c.w/2, -c.h/2, c.w, c.h);
+        }
+        ctx.restore();
+    });
+
+    bullets.forEach(b => {
+        ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(Math.atan2(b.vy, b.vx));
+        ctx.fillStyle = "rgba(255,255,255,0.7)"; 
+        ctx.beginPath(); ctx.moveTo(0, 8); ctx.lineTo(-140, 0); ctx.lineTo(0, -8); ctx.fill();
+        ctx.fillStyle = b.fromPlayer ? "#fff" : "#f33";
+        ctx.beginPath(); ctx.arc(0, 0, 6, 0, Math.PI*2); ctx.fill();
+        ctx.restore();
+    });
+    if (isSlowMoActive) { ctx.fillStyle = "rgba(0, 255, 0, 0.05)"; ctx.fillRect(0,0, canvas.width, canvas.height); }
+}
+
+window.addEventListener('mousedown', (e) => { 
+    if(gameRunning && e.target.type !== 'checkbox' && e.target.id !== 'resetBtn') createBullet(player); 
+});
+window.addEventListener('touchstart', (e) => { 
+    if(gameRunning && e.target.type !== 'checkbox' && e.target.id !== 'resetBtn') {
+        e.preventDefault(); 
+        createBullet(player); 
+    }
+});
+update();
+</script>
+</body>
+</html>
